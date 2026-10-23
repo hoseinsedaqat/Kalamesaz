@@ -32,7 +32,6 @@ on:
 
 permissions:
   contents: write
-  checks: write
 
 # از دوتایی شدن ساخت روی یک شاخه جلوگیری می‌کند.
 concurrency:
@@ -250,6 +249,19 @@ jobs:
           if-no-files-found: error
           retention-days: 14
 
+      # اگر ساخت شکست خورد، لاگ‌ها را نگه می‌داریم تا بشود علت را خواند
+      # (به‌جای جست‌وجو در خروجیِ طولانیِ Gradle).
+      - name: Upload build logs on failure
+        if: failure()
+        uses: actions/upload-artifact@v5
+        with:
+          name: build-logs
+          path: |
+            .ci-logs/*.log
+            android/build.log
+          if-no-files-found: ignore
+          retention-days: 7
+
       - name: Publish on the Releases page
         if: success() && (github.event_name != 'workflow_dispatch' || github.event.inputs.publish_release != 'false')
         env:
@@ -294,22 +306,3 @@ jobs:
           gh release upload "$RELEASE_TAG" "$APK_NAME" "$APK_NAME.sha256" --clobber
           gh release edit "$RELEASE_TAG" --title "کلمه‌ساز $VERSION (APK)" --notes-file notes.md
           echo "منتشر شد: $URL"
-
-      # ---- موقت: فقط برای این که عامل بتواند لاگ شکست را بخواند ----
-      - name: Publish build log for debugging
-        if: failure()
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          set -uo pipefail
-          : > /tmp/tail.log
-          for LOG in .ci-logs/*.log android/build.log; do
-            [ -f "$LOG" ] || continue
-            { echo "===== $LOG ====="; tail -c 25000 "$LOG"; echo; } >> /tmp/tail.log
-          done
-          [ -s /tmp/tail.log ] || exit 0
-          jq -n --rawfile text /tmp/tail.log --arg sha "$GITHUB_SHA" \
-            '{name:"ci-debug-log", head_sha:$sha, status:"completed", conclusion:"neutral",
-              output:{title:"APK build log", summary:"tail of gradle output (debug only)", text:$text}}' \
-            > /tmp/check-run.json
-          gh api -X POST "repos/$GITHUB_REPOSITORY/check-runs" --input /tmp/check-run.json > /dev/null || true
