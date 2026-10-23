@@ -8,6 +8,8 @@
 #   • «yes | sdkmanager --licenses» زیر پوستهٔ پیش‌فرض گیت‌هاب (bash -eo pipefail)
 #     شکست می‌خورد: دستور yes با SIGPIPE کشته می‌شود و pipefail کل خط لوله را
 #     ناموفق می‌کند. خروجی این دستور عمداً نادیده گرفته می‌شود.
+#   • بیشتر بسته‌های SDK روی رانر از پیش نصب‌اند؛ فقط چیزی نصب می‌شود که واقعاً
+#     نباشد (کمتر وابسته به شبکه، شکست کمتر).
 #   • فایل android/gradlew در گیت مجوز اجرا نداشت و «./gradlew» با Permission
 #     denied در ۰ ثانیه شکست می‌خورد. مجوز در مخزن درست شده و اینجا هم با chmod
 #     بیمه می‌شود.
@@ -72,78 +74,114 @@ jobs:
             set -uo pipefail
 
             SDK_ROOT="${ANDROID_HOME:-${ANDROID_SDK_ROOT:-}}"
-          if [ -z "$SDK_ROOT" ] || [ ! -d "$SDK_ROOT" ]; then
-            echo "::error::Android SDK پیدا نشد (ANDROID_HOME تنظیم نیست)."
-            exit 1
-          fi
+            if [ -z "$SDK_ROOT" ] || [ ! -d "$SDK_ROOT" ]; then
+              echo "::error::Android SDK پیدا نشد (ANDROID_HOME تنظیم نیست)."
+              exit 1
+            fi
 
-          SM="$SDK_ROOT/cmdline-tools/latest/bin/sdkmanager"
-          if [ ! -x "$SM" ]; then
-            SM="$(command -v sdkmanager || true)"
-          fi
-          if [ -z "$SM" ] || [ ! -x "$SM" ]; then
-            echo "::error::sdkmanager پیدا نشد."
-            exit 1
-          fi
-          echo "sdkmanager: $SM"
+            SM="$SDK_ROOT/cmdline-tools/latest/bin/sdkmanager"
+            if [ ! -x "$SM" ]; then
+              SM="$(command -v sdkmanager || true)"
+            fi
+            if [ -z "$SM" ] || [ ! -x "$SM" ]; then
+              echo "::error::sdkmanager پیدا نشد."
+              exit 1
+            fi
 
-          # پذیرش پروانه‌ها؛ خروجی عمداً نادیده گرفته می‌شود (توضیح بالا).
-          yes 2>/dev/null | "$SM" --licenses > /dev/null 2>&1 || true
+            echo "== محیط =="
+            echo "ANDROID_HOME=$SDK_ROOT"
+            echo "JAVA_HOME=${JAVA_HOME:-تنظیم نشده}"
+            java -version 2>&1 | head -1
+            echo "sdkmanager=$SM"
+            echo
+            echo "== sdkmanager --version =="
+            "$SM" --version 2>&1 | head -10
+            echo
+            echo "== بسته‌های نصب‌شده =="
+            "$SM" --list_installed 2>&1 | head -40
+            echo
 
-          install_package() {
-            local package="$1" attempt
-            for attempt in 1 2; do
-              if yes 2>/dev/null | "$SM" "$package" > /dev/null 2>&1; then
-                echo "✓ نصب/موجود: $package"
-                return 0
-              fi
-              echo "! تلاش $attempt برای «$package» ناموفق بود"
-              sleep 3
-            done
-            return 1
-          }
+            # پذیرش پروانه‌ها؛ خروجی عمداً نادیده گرفته می‌شود (توضیح بالا).
+            yes 2>/dev/null | "$SM" --licenses > /dev/null 2>&1 \
+              || echo "! پذیرش پروانه‌ها پیامی داشت (ادامه می‌دهیم)"
 
-          # نام بستهٔ پلتفرم در نسخه‌های تازهٔ SDK ممکن است با پسوند جزئی
-          # (android-37.2 و مانند آن) منتشر شود؛ برای همین چند نام را به‌ترتیب
-          # امتحان می‌کنیم تا ساخت به خاطر یک نامِ در دسترس نبودن متوقف نشود.
-          install_first() {
-            local package
-            for package in "$@"; do
-              if install_package "$package"; then
-                return 0
-              fi
-            done
-            return 1
-          }
+            install_package() {
+              local package="$1" attempt out status
+              for attempt in 1 2; do
+                out=$(yes 2>/dev/null | "$SM" "$package" 2>&1)
+                status=$?
+                if [ "$status" -eq 0 ]; then
+                  echo "✓ نصب/موجود: $package"
+                  return 0
+                fi
+                echo "! تلاش $attempt برای «$package» ناموفق بود (کد $status)"
+                if [ "$attempt" -eq 2 ]; then
+                  echo "----- خروجی sdkmanager -----"
+                  echo "$out" | tail -30
+                  echo "----------------------------"
+                fi
+                sleep 3
+              done
+              return 1
+            }
 
-          # نسخه‌ها از android/build.gradle می‌آیند: compileSdk 37، build-tools
-          # 37.0.0 و NDK 27.1.12297006.
-          if ! install_package "platform-tools"; then
-            echo "::error::نصب platform-tools ناموفق بود؛ ساخت ممکن نیست."
-            exit 1
-          fi
+            # نام بستهٔ پلتفرم در نسخه‌های تازهٔ SDK ممکن است با پسوند جزئی
+            # (مثل android-37.2) منتشر شود؛ چند نام را به‌ترتیب امتحان می‌کنیم.
+            install_first() {
+              local package
+              for package in "$@"; do
+                install_package "$package" && return 0
+              done
+              return 1
+            }
 
-          if ! install_first "platforms;android-37" "platforms;android-37.2" \
-              "platforms;android-37.1" "platforms;android-37.0"; then
-            echo "::error::هیچ پلتفرم اندروید ۳۷ نصب نشد؛ compileSdk=37 در build.gradle"
-            echo "::error::نیازمند پلتفرم ۳۷ است."
-            exit 1
-          fi
+            echo "== بررسی/نصب پلتفرم اندروید ۳۷ (compileSdk) =="
+            if ls -d "$SDK_ROOT"/platforms/android-37* > /dev/null 2>&1; then
+              echo "✓ از پیش نصب است: $(ls "$SDK_ROOT/platforms" | tr '\n' ' ')"
+            else
+              install_first "platforms;android-37" "platforms;android-37.2" \
+                  "platforms;android-37.1" "platforms;android-37.0" || {
+                echo "::error::هیچ پلتفرم اندروید ۳۷ نصب نشد؛ compileSdk=37 در build.gradle"
+                echo "::error::به آن نیاز دارد."
+                exit 1
+              }
+            fi
 
-          if ! install_first "build-tools;37.0.0" "build-tools;36.0.0"; then
-            echo "::error::هیچ build-tools مناسبی نصب نشد؛ ساخت ممکن نیست."
-            exit 1
-          fi
+            echo "== بررسی/نصب build-tools =="
+            if [ -d "$SDK_ROOT/build-tools/37.0.0" ]; then
+              echo "✓ build-tools 37.0.0 از پیش نصب است"
+            else
+              install_first "build-tools;37.0.0" "build-tools;36.0.0" || {
+                echo "::error::هیچ build-tools مناسبی نصب نشد؛ ساخت ممکن نیست."
+                exit 1
+              }
+            fi
 
-          # NDK فقط برای کتابخانه‌های بومی (reanimated/worklets) لازم است؛ اگر
-          # نصب نشد، ادامه می‌دهیم و AGP در صورت نیاز خودش آن را می‌گیرد.
-          install_package "ndk;27.1.12297006" \
-            || echo "::warning::NDK 27.1 نصب نشد؛ ادامه با NDK موجود روی رانر."
+            echo "== بررسی/نصب platform-tools =="
+            if [ -d "$SDK_ROOT/platform-tools" ]; then
+              echo "✓ platform-tools از پیش نصب است"
+            else
+              install_package "platform-tools" || {
+                echo "::error::نصب platform-tools ناموفق بود."
+                exit 1
+              }
+            fi
 
-          echo "پلتفرم‌ها: $(ls "$SDK_ROOT/platforms" 2>/dev/null | tr '\n' ' ')"
-          echo "build-tools: $(ls "$SDK_ROOT/build-tools" 2>/dev/null | tr '\n' ' ')"
-          echo "NDKها: $(ls "$SDK_ROOT/ndk" 2>/dev/null | tr '\n' ' ')"
-          exit 0
+            echo "== بررسی/نصب NDK 27.1 (کتابخانه‌های بومی reanimated/worklets) =="
+            if [ -d "$SDK_ROOT/ndk/27.1.12297006" ]; then
+              echo "✓ NDK 27.1.12297006 از پیش نصب است"
+            else
+              install_package "ndk;27.1.12297006" \
+                || echo "::warning::NDK 27.1 نصب نشد؛ AGP در صورت نیاز خودش آن را می‌گیرد."
+            fi
+
+            echo
+            echo "== وضعیت پایانی SDK =="
+            echo "پلتفرم‌ها: $(ls "$SDK_ROOT/platforms" 2>/dev/null | tr '\n' ' ')"
+            echo "build-tools: $(ls "$SDK_ROOT/build-tools" 2>/dev/null | tr '\n' ' ')"
+            echo "NDKها: $(ls "$SDK_ROOT/ndk" 2>/dev/null | tr '\n' ' ')"
+            echo "پروانه‌ها: $(ls "$SDK_ROOT/licenses" 2>/dev/null | tr '\n' ' ')"
+            exit 0
           } 2>&1 | tee .ci-logs/sdk-install.log
           exit "${PIPESTATUS[0]}"
 
