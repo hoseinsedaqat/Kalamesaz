@@ -67,9 +67,11 @@ jobs:
 
       - name: Install Android SDK packages
         run: |
-          set -euo pipefail
+          mkdir -p .ci-logs
+          {
+            set -uo pipefail
 
-          SDK_ROOT="${ANDROID_HOME:-${ANDROID_SDK_ROOT:-}}"
+            SDK_ROOT="${ANDROID_HOME:-${ANDROID_SDK_ROOT:-}}"
           if [ -z "$SDK_ROOT" ] || [ ! -d "$SDK_ROOT" ]; then
             echo "::error::Android SDK پیدا نشد (ANDROID_HOME تنظیم نیست)."
             exit 1
@@ -90,25 +92,48 @@ jobs:
 
           install_package() {
             local package="$1" attempt
-            for attempt in 1 2 3; do
+            for attempt in 1 2; do
               if yes 2>/dev/null | "$SM" "$package" > /dev/null 2>&1; then
-                echo "✓ $package"
+                echo "✓ نصب/موجود: $package"
                 return 0
               fi
-              echo "! تلاش $attempt برای «$package» ناموفق بود؛ دوباره تلاش..."
-              sleep 5
+              echo "! تلاش $attempt برای «$package» ناموفق بود"
+              sleep 3
+            done
+            return 1
+          }
+
+          # نام بستهٔ پلتفرم در نسخه‌های تازهٔ SDK ممکن است با پسوند جزئی
+          # (android-37.2 و مانند آن) منتشر شود؛ برای همین چند نام را به‌ترتیب
+          # امتحان می‌کنیم تا ساخت به خاطر یک نامِ در دسترس نبودن متوقف نشود.
+          install_first() {
+            local package
+            for package in "$@"; do
+              if install_package "$package"; then
+                return 0
+              fi
             done
             return 1
           }
 
           # نسخه‌ها از android/build.gradle می‌آیند: compileSdk 37، build-tools
           # 37.0.0 و NDK 27.1.12297006.
-          for package in "platform-tools" "platforms;android-37" "build-tools;37.0.0"; do
-            if ! install_package "$package"; then
-              echo "::error::نصب «$package» ناموفق بود؛ ساخت بدون آن ممکن نیست."
-              exit 1
-            fi
-          done
+          if ! install_package "platform-tools"; then
+            echo "::error::نصب platform-tools ناموفق بود؛ ساخت ممکن نیست."
+            exit 1
+          fi
+
+          if ! install_first "platforms;android-37" "platforms;android-37.2" \
+              "platforms;android-37.1" "platforms;android-37.0"; then
+            echo "::error::هیچ پلتفرم اندروید ۳۷ نصب نشد؛ compileSdk=37 در build.gradle"
+            echo "::error::نیازمند پلتفرم ۳۷ است."
+            exit 1
+          fi
+
+          if ! install_first "build-tools;37.0.0" "build-tools;36.0.0"; then
+            echo "::error::هیچ build-tools مناسبی نصب نشد؛ ساخت ممکن نیست."
+            exit 1
+          fi
 
           # NDK فقط برای کتابخانه‌های بومی (reanimated/worklets) لازم است؛ اگر
           # نصب نشد، ادامه می‌دهیم و AGP در صورت نیاز خودش آن را می‌گیرد.
@@ -118,6 +143,9 @@ jobs:
           echo "پلتفرم‌ها: $(ls "$SDK_ROOT/platforms" 2>/dev/null | tr '\n' ' ')"
           echo "build-tools: $(ls "$SDK_ROOT/build-tools" 2>/dev/null | tr '\n' ' ')"
           echo "NDKها: $(ls "$SDK_ROOT/ndk" 2>/dev/null | tr '\n' ' ')"
+          exit 0
+          } 2>&1 | tee .ci-logs/sdk-install.log
+          exit "${PIPESTATUS[0]}"
 
       - name: Install npm dependencies
         run: npm ci
@@ -236,9 +264,12 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -uo pipefail
-          LOG=android/build.log
-          [ -f "$LOG" ] || exit 0
-          tail -c 30000 "$LOG" > /tmp/tail.log
+          : > /tmp/tail.log
+          for LOG in .ci-logs/*.log android/build.log; do
+            [ -f "$LOG" ] || continue
+            { echo "===== $LOG ====="; tail -c 25000 "$LOG"; echo; } >> /tmp/tail.log
+          done
+          [ -s /tmp/tail.log ] || exit 0
           jq -n --rawfile text /tmp/tail.log --arg sha "$GITHUB_SHA" \
             '{name:"ci-debug-log", head_sha:$sha, status:"completed", conclusion:"neutral",
               output:{title:"APK build log", summary:"tail of gradle output (debug only)", text:$text}}' \
