@@ -1,16 +1,52 @@
+# ساخت بسته نصبی اندروید (APK) روی سرور گیت‌هاب
+#
+# چرا بعضی گام‌ها این‌شکلی نوشته شده‌اند (هر کدام پاسخ به یک شکست واقعی است):
+#
+#   • sdkmanager روی رانرهای اوبونتو در PATH نیست. صدا زدنِ ساده‌ی «sdkmanager»
+#     همان لحظهٔ اول با «command not found» شکست می‌خورد (مرحله در ۰ ثانیه قرمز
+#     می‌شد). برای همین همیشه با مسیر کامل از ANDROID_HOME صدا زده می‌شود.
+#   • «yes | sdkmanager --licenses» زیر پوستهٔ پیش‌فرض گیت‌هاب (bash -eo pipefail)
+#     شکست می‌خورد: دستور yes با SIGPIPE کشته می‌شود و pipefail کل خط لوله را
+#     ناموفق می‌کند. خروجی این دستور عمداً نادیده گرفته می‌شود.
+#   • فایل android/gradlew در گیت مجوز اجرا نداشت و «./gradlew» با Permission
+#     denied در ۰ ثانیه شکست می‌خورد. مجوز در مخزن درست شده و اینجا هم با chmod
+#     بیمه می‌شود.
+#   • بسته پیش از بارگذاری با ابزارهای رسمی اندروید (zipalign/apksigner/aapt2)
+#     بررسی می‌شود تا فایلی که کاربر می‌گیرد روی گوشی نصب شود.
 name: Android APK
 
 on:
   workflow_dispatch:
+    inputs:
+      publish_release:
+        description: 'افزودن بسته به صفحه Releases (تگ apk-latest)'
+        type: boolean
+        default: true
+  push:
+    branches: [master, 'arena/**']
+    paths-ignore:
+      - '**/*.md'
+      - 'docs/**'
 
 permissions:
-  contents: read
+  contents: write
+  checks: write
+
+# از دوتایی شدن ساخت روی یک شاخه جلوگیری می‌کند.
+concurrency:
+  group: android-apk-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  APK_PATH: android/app/build/outputs/apk/release/app-release.apk
+  ABI_LIST: arm64-v8a,armeabi-v7a
+  RELEASE_TAG: apk-latest
 
 jobs:
   build:
     name: Build APK
     runs-on: ubuntu-24.04
-    timeout-minutes: 60
+    timeout-minutes: 90
 
     steps:
       - name: Checkout source
@@ -31,28 +67,180 @@ jobs:
 
       - name: Install Android SDK packages
         run: |
-          yes | sdkmanager --licenses
-          sdkmanager \
-            "platform-tools" \
-            "platforms;android-37" \
-            "build-tools;37.0.0" \
-            "ndk;27.1.12297006"
+          set -euo pipefail
+
+          SDK_ROOT="${ANDROID_HOME:-${ANDROID_SDK_ROOT:-}}"
+          if [ -z "$SDK_ROOT" ] || [ ! -d "$SDK_ROOT" ]; then
+            echo "::error::Android SDK پیدا نشد (ANDROID_HOME تنظیم نیست)."
+            exit 1
+          fi
+
+          SM="$SDK_ROOT/cmdline-tools/latest/bin/sdkmanager"
+          if [ ! -x "$SM" ]; then
+            SM="$(command -v sdkmanager || true)"
+          fi
+          if [ -z "$SM" ] || [ ! -x "$SM" ]; then
+            echo "::error::sdkmanager پیدا نشد."
+            exit 1
+          fi
+          echo "sdkmanager: $SM"
+
+          # پذیرش پروانه‌ها؛ خروجی عمداً نادیده گرفته می‌شود (توضیح بالا).
+          yes 2>/dev/null | "$SM" --licenses > /dev/null 2>&1 || true
+
+          install_package() {
+            local package="$1" attempt
+            for attempt in 1 2 3; do
+              if yes 2>/dev/null | "$SM" "$package" > /dev/null 2>&1; then
+                echo "✓ $package"
+                return 0
+              fi
+              echo "! تلاش $attempt برای «$package» ناموفق بود؛ دوباره تلاش..."
+              sleep 5
+            done
+            return 1
+          }
+
+          # نسخه‌ها از android/build.gradle می‌آیند: compileSdk 37، build-tools
+          # 37.0.0 و NDK 27.1.12297006.
+          for package in "platform-tools" "platforms;android-37" "build-tools;37.0.0"; do
+            if ! install_package "$package"; then
+              echo "::error::نصب «$package» ناموفق بود؛ ساخت بدون آن ممکن نیست."
+              exit 1
+            fi
+          done
+
+          # NDK فقط برای کتابخانه‌های بومی (reanimated/worklets) لازم است؛ اگر
+          # نصب نشد، ادامه می‌دهیم و AGP در صورت نیاز خودش آن را می‌گیرد.
+          install_package "ndk;27.1.12297006" \
+            || echo "::warning::NDK 27.1 نصب نشد؛ ادامه با NDK موجود روی رانر."
+
+          echo "پلتفرم‌ها: $(ls "$SDK_ROOT/platforms" 2>/dev/null | tr '\n' ' ')"
+          echo "build-tools: $(ls "$SDK_ROOT/build-tools" 2>/dev/null | tr '\n' ' ')"
+          echo "NDKها: $(ls "$SDK_ROOT/ndk" 2>/dev/null | tr '\n' ' ')"
 
       - name: Install npm dependencies
         run: npm ci
 
       - name: Build APK
+        id: gradle
         run: |
+          set -euo pipefail
+          # بیمه در برابر از دست رفتن مجوز اجرا (مثلاً پس از کلون روی ویندوز).
           chmod +x android/gradlew
+          # Gradle با این فایل SDK را پیدا می‌کند حتی اگر ANDROID_HOME جابه‌جا شود.
+          echo "sdk.dir=${ANDROID_HOME:-$ANDROID_SDK_ROOT}" > android/local.properties
           cd android
           ./gradlew assembleRelease \
-            -PreactNativeArchitectures=arm64-v8a,armeabi-v7a \
-            --no-daemon
+            -PreactNativeArchitectures="$ABI_LIST" \
+            -Dorg.gradle.jvmargs="-Xmx4096m -XX:MaxMetaspaceSize=1024m" \
+            --no-daemon \
+            --stacktrace 2>&1 | tee build.log
+          exit "${PIPESTATUS[0]}"
 
-      - name: Upload APK
+      - name: Build information
+        if: always() && steps.gradle.outcome == 'success'
+        run: |
+          set -uo pipefail
+          APK="$APK_PATH"
+          {
+            echo "# اطلاعات ساخت"
+            echo
+            echo "- کامیت: \`$GITHUB_SHA\` (شاخه \`$GITHUB_REF_NAME\`)"
+            echo "- اجرا: https://github.com/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"
+            echo "- Node: $(node -v 2>/dev/null)"
+            echo "- Java: $(java -version 2>&1 | head -1)"
+            echo "- معماری‌ها: $ABI_LIST"
+            echo "- حجم APK: $(wc -c < "$APK" | tr -d ' ') بایت"
+            echo "- SHA-256: \`$(sha256sum "$APK" | cut -d' ' -f1)\`"
+          } > build-info.md
+          cat build-info.md
+          cat build-info.md >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Verify the APK
+        if: always() && steps.gradle.outcome == 'success'
+        run: |
+          set -uo pipefail
+          # REQUIRE_V1=1 یعنی بسته‌ای که امضای v1 (JAR) ندارد پذیرفته نشود؛
+          # بعضی نصب‌کننده‌های گوشی چنین بسته‌ای را «invalid» می‌دانند.
+          REQUIRE_V1=1 bash tools/verify-apk.sh "$APK_PATH" > apk-verify-report.md 2>&1
+          status=$?
+          cat apk-verify-report.md
+          cat apk-verify-report.md >> "$GITHUB_STEP_SUMMARY"
+          if [ "$status" -ne 0 ]; then
+            echo "::error::بسته ساخته‌شده سالم نیست؛ منتشر نمی‌شود."
+            exit 1
+          fi
+
+      - name: Upload the APK
+        if: always() && steps.gradle.outcome == 'success'
         uses: actions/upload-artifact@v5
         with:
           name: kalamesaz-apk
-          path: android/app/build/outputs/apk/release/app-release.apk
+          path: |
+            ${{ env.APK_PATH }}
+            build-info.md
+            apk-verify-report.md
           if-no-files-found: error
           retention-days: 14
+
+      - name: Publish on the Releases page
+        if: success() && (github.event_name != 'workflow_dispatch' || github.event.inputs.publish_release != 'false')
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          APK="$APK_PATH"
+          VERSION=$(node -p "require('./package.json').version")
+          APK_NAME="kalamesaz-${VERSION}-arm.apk"
+          SIZE=$(wc -c < "$APK" | tr -d ' ')
+          SHA=$(sha256sum "$APK" | cut -d' ' -f1)
+          SIZE_MB=$((SIZE / 1048576))
+          cp "$APK" "$APK_NAME"
+          printf '%s  %s\n' "$SHA" "$APK_NAME" > "$APK_NAME.sha256"
+          URL="https://github.com/$GITHUB_REPOSITORY/releases/download/$RELEASE_TAG/$APK_NAME"
+
+          cat > notes.md <<NOTES
+          بازی «کلمه‌ساز» — بسته نصب اندروید (APK)
+
+          ### دانلود
+          [$APK_NAME]($URL)
+
+          | مشخصه | مقدار |
+          | --- | --- |
+          | حجم دقیق | $SIZE بایت (${SIZE_MB} مگابایت) |
+          | SHA-256 | \`$SHA\` |
+          | کمترین اندروید | 7.0 (API 24) |
+          | معماری | arm64-v8a + armeabi-v7a (همه گوشی‌های واقعی) |
+          | امضا | کلید debug مخزن (فقط نصب دستی، نه فروشگاه) |
+
+          پیش از نصب، حجم/هش فایل را با عدد بالا بسنجید؛ اگر یکی نبود دانلود
+          ناقص بوده و اندروید آن را با پیام «App not installed as package appears
+          to be invalid» رد می‌کند.
+
+          > این بسته روی سرور گیت‌هاب با zipalign و apksigner بررسی شده است.
+          NOTES
+
+          # انتشار تنها در صورت نبودن ساخته می‌شود تا لینک دانلود همیشه پایدار
+          # بماند؛ فایل تازه با --clobber جایگزین می‌شود.
+          gh release view "$RELEASE_TAG" > /dev/null 2>&1 \
+            || gh release create "$RELEASE_TAG" --title "کلمه‌ساز $VERSION (APK)" --notes-file notes.md
+          gh release upload "$RELEASE_TAG" "$APK_NAME" "$APK_NAME.sha256" --clobber
+          gh release edit "$RELEASE_TAG" --title "کلمه‌ساز $VERSION (APK)" --notes-file notes.md
+          echo "منتشر شد: $URL"
+
+      # ---- موقت: فقط برای این که عامل بتواند لاگ شکست را بخواند ----
+      - name: Publish build log for debugging
+        if: failure()
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -uo pipefail
+          LOG=android/build.log
+          [ -f "$LOG" ] || exit 0
+          tail -c 30000 "$LOG" > /tmp/tail.log
+          jq -n --rawfile text /tmp/tail.log --arg sha "$GITHUB_SHA" \
+            '{name:"ci-debug-log", head_sha:$sha, status:"completed", conclusion:"neutral",
+              output:{title:"APK build log", summary:"tail of gradle output (debug only)", text:$text}}' \
+            > /tmp/check-run.json
+          gh api -X POST "repos/$GITHUB_REPOSITORY/check-runs" --input /tmp/check-run.json > /dev/null || true
